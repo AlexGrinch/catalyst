@@ -106,7 +106,7 @@ class Critic(StateActionNet):
 
 class ValueCritic(StateNet):
     """
-    Critic which learns state-action value function Q(s,a).
+    Critic which learns state value function V(s).
     """
 
     @classmethod

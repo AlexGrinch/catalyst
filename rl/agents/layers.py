@@ -3,7 +3,12 @@ import torch.nn as nn
 
 from catalyst.contrib.models import SequentialNet
 from catalyst.dl.initialization import create_optimal_inner_init, outer_init
-from catalyst.rl.agents.utils import log1p_exp, get_out_features
+from catalyst.rl.agents.utils import log1p_exp, get_out_features, \
+    normal_sample, normal_log_prob
+
+# log_sigma of Gaussian policy are capped at (LOG_SIG_MIN, LOG_SIG_MAX)
+LOG_SIG_MAX = 2
+LOG_SIG_MIN = -10
 
 
 class TemporalAttentionPooling(nn.Module):
@@ -110,11 +115,12 @@ class LamaPooling(nn.Module):
 
 
 class StateNet(nn.Module):
-    def __init__(self, observation_net, head_net, memory_net=None):
+    def __init__(self, observation_net, head_net, policy_net, memory_net=None):
         super().__init__()
         self.observation_net = observation_net
         self.memory_net = memory_net
         self.head_net = head_net
+        self.policy_net = policy_net
 
         self.out_features = get_out_features(head_net)
 
@@ -152,9 +158,14 @@ class StateNet(nn.Module):
         x = self.head_net(x)
         return x
 
-    def forward(self, *args, **kwargs):
-        action = self._forward_fn(*args, **kwargs)
-        return action
+    def forward(self, *args, with_log_pi=False, **kwargs):
+        x = self._forward_fn(*args, **kwargs)
+        if isinstance(self.policy_net, GaussPolicy):
+            return self.policy_net(x, with_log_pi)
+        elif isinstance(self.policy_net, RealNVPPolicy):
+            return self.policy_net(x, with_log_pi)
+        else:
+            return x
 
 
 class StateActionNet(nn.Module):
@@ -217,30 +228,99 @@ class StateActionNet(nn.Module):
         return value
 
 
+class GaussPolicy(nn.Module):
+    def __init__(self, squashing_fn=nn.Tanh):
+        super().__init__()
+        self.squashing_layer = SquashingLayer(squashing_fn)
+
+    def forward(self, inputs, with_log_pi=True):
+        action_size = inputs.shape[1] // 2
+        mu, log_sigma = inputs[:, :action_size], inputs[:, action_size:]
+        log_sigma = torch.clamp(log_sigma, LOG_SIG_MIN, LOG_SIG_MAX)
+        sigma = torch.exp(log_sigma)
+        z = normal_sample(mu, sigma)
+        log_pi = normal_log_prob(mu, sigma, z)
+        action, log_pi = self.squashing_layer.forward(z, log_pi)
+
+        if with_log_pi:
+            return action, log_pi
+        return action
+
+
+class RealNVPPolicy(nn.Module):
+    def __init__(
+        self,
+        action_size,
+        layer_fn,
+        activation_fn=nn.ReLU,
+        squashing_fn=nn.Tanh,
+        norm_fn=None,
+        bias=False
+    ):
+        super().__init__()
+        # hack to prevent cycle imports
+        from catalyst.contrib.modules import name2nn
+        activation_fn = name2nn(activation_fn)
+        self.action_size = action_size
+
+        self.coupling1 = CouplingLayer(
+            action_size=action_size,
+            layer_fn=layer_fn,
+            activation_fn=activation_fn,
+            norm_fn=None,
+            bias=bias,
+            parity="odd"
+        )
+        self.coupling2 = CouplingLayer(
+            action_size=action_size,
+            layer_fn=layer_fn,
+            activation_fn=activation_fn,
+            norm_fn=None,
+            bias=bias,
+            parity="even"
+        )
+        self.squashing_layer = SquashingLayer(squashing_fn)
+
+    def forward(self, inputs, with_log_pi=True):
+        state_embedding = inputs
+        mu = torch.zeros(
+            (state_embedding.shape[0], self.action_size)
+        ).to(state_embedding.device)
+        sigma = torch.ones_like(mu).to(mu.device)
+        z = normal_sample(mu, sigma)
+        log_pi = normal_log_prob(mu, sigma, z)
+        z, log_pi = self.coupling1.forward(z, state_embedding, log_pi)
+        z, log_pi = self.coupling2.forward(z, state_embedding, log_pi)
+        action, log_pi = self.squashing_layer.forward(z, log_pi)
+
+        if with_log_pi:
+            return action, log_pi
+        return action
+
+
 class SquashingLayer(nn.Module):
-    def __init__(self, activation_fn=nn.Tanh):
+    def __init__(self, squashing_fn=nn.Tanh):
         """ Layer that squashes samples from some distribution to be bounded.
         """
         super().__init__()
         # hack to prevent cycle imports
         from catalyst.contrib.modules import name2nn
-        self.activation = name2nn(activation_fn)()
+        self.squashing_fn = name2nn(squashing_fn)()
 
     def forward(self, action, log_pi):
         # compute log det jacobian of squashing transformation
-        if isinstance(self.activation, nn.Tanh):
+        if isinstance(self.squashing_fn, nn.Tanh):
             log2 = torch.log(torch.tensor(2.0).to(action.device))
             log_det_jacobian = 2 * (log2 + action - log1p_exp(2 * action))
             log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
-        elif isinstance(self.activation, nn.Sigmoid):
+        elif isinstance(self.squashing_fn, nn.Sigmoid):
             log_det_jacobian = -action - 2 * log1p_exp(-action)
             log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
-        elif isinstance(self.activation, None):
+        elif isinstance(self.squashing_fn, None):
             return action, log_pi
         else:
             raise NotImplementedError
-
-        action = self.activation.forward(action)
+        action = self.squashing_fn.forward(action)
         log_pi = log_pi - log_det_jacobian
         return action, log_pi
 
